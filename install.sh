@@ -51,7 +51,7 @@ install -m 0644 "$SRC/dsh-plugin/SKILL.md" "$SKILL_DIR/SKILL.md"
 # 3) 安装运行时（认领引擎 + 看门狗 + 通知 + 客户端 + 保活薄封装）
 say "安装运行时 → $TASKHUB_HOME"
 mkdir -p "$TASKHUB_HOME/inbox"
-for f in worker_all.py guard_all.py qq_notify.py notify_check.py; do
+for f in worker_all.py guard_all.py qq_notify.py notify_check.py executor_web.py; do
   install -m 0644 "$SRC/dsh-for-all/$f" "$TASKHUB_HOME/$f"
 done
 install -m 0755 "$SRC/dsh-plugin/board.py"     "$TASKHUB_HOME/board.py"
