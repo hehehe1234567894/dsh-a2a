@@ -1,4 +1,4 @@
-# install.ps1 —— dsh-for-all 个人电脑（Windows 笔记本/桌面）场景一键部署
+﻿# install.ps1 —— dsh-for-all 个人电脑（Windows 笔记本/桌面）场景一键部署
 #
 # 个人电脑场景目标（继承 dsh-laptop/ 专版经验）：开机不自启、锚定锚进程（默认 DSH Desktop）
 # 运行才抢任务、资源占用低、退出干净不留残余进程。
@@ -33,7 +33,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$EditionDir = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)  # dsh-for-all\
+$EditionDir = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path))  # dsh-for-all\（本脚本在 deploy\laptop\ 下，需上溯三级）
 $RepoRoot   = Split-Path -Parent $EditionDir                                        # 仓库根
 $SkillDir   = Join-Path $ProjectRoot '.dsh\skills\taskhub'
 $TaskDir    = Join-Path $ProjectRoot 'taskhub'

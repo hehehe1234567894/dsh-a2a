@@ -98,6 +98,8 @@ cd ~/DSHBuild/taskhub && set -a && source taskhub.env && set +a \
 - **资格门禁（§3）**：默认 `undeclared=skip` 严格执行——正文无 `资格：` 声明行的任务一律不领（宁可错过不可误抢）；新版支持兼容梯子（标题 `[专属 X]/[通用]` → 标签 `for:/parent:` → `[任务]` 兜底）
 - **自动执行**：认领成功后自动派生 `dsh --profile headless` 执行会话真实完成并自行 complete/fail；日志在 `taskhub/executions/<issue>.log`；`TASKHUB_EXEC=0` 可关闭
 - **容量（§10）**：`TASKHUB_MAX_LOAD` 默认 1；**退避（§11）**：连续 2 次抢失败本轮停止；**优先（§12）**：P0/P1 优先同级 FIFO
+- **变更监听（§13）**：名下任务正文 hash 监听——变更即向 web 执行会话 queue prompt 通知（SPEC UPDATE）+ 落盘 claims.log；发布方评论 `[CANCEL #N]` 即时终止执行器并 release；执行器 prompt 附**正文全文 + 全部评论**快照（上下文读全原则）
+- **需求变更 SOP（§13，发布方）**：花钱任务两阶段（先方案后生成）；改需求 = 先 `update --issue N --body-file <md> --comment "要点"`（spec-v 自动 +1）→ 需返工再 reopen → 评论通知；禁止先 reopen 再改正文
 - 认领事件落盘 `inbox/claims.log`（JSONL），会话播报用 `python3 ~/.dsh/skills/taskhub/notify_check.py`
 - QQ 推送读 `~/.dsh/.credentials.yaml` 的 QQBOT_APP_SECRET，与 DSH qqbot 插件同源，无需额外配置
 

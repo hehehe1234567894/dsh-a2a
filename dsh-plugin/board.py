@@ -38,6 +38,7 @@ board.py — TaskHub 跨机器 Agent 任务黑板客户端（GitHub Issues 版�
 import argparse
 import json
 import os
+import re
 import socket
 import sys
 import threading
@@ -694,6 +695,55 @@ def cmd_reopen(args):
     print("✓ #%s 已重新打开，状态 pending。" % args.issue)
 
 
+# ------------------------------------------------------------- 需求变更（§13）
+
+SPEC_V_RE = re.compile(r"^spec-v:\s*(\d+)\s*$", re.MULTILINE)
+
+
+def _bump_spec_v(body):
+    """维护正文 spec-v 版本行（§13.2）：无则插到首行（资格行）之后，有则 +1。返回 (body, ver)。"""
+    m = SPEC_V_RE.search(body)
+    if m:
+        ver = int(m.group(1)) + 1
+        return SPEC_V_RE.sub("spec-v: %d" % ver, body, count=1), ver
+    ver = 1
+    lines = body.splitlines()
+    head = lines[0] if lines else ""
+    rest = lines[1:] if len(lines) > 1 else []
+    return "\n".join([head, "spec-v: %d" % ver] + rest), ver
+
+
+def do_update(gh, number, body_file=None, append_file=None, comment=None):
+    """需求变更（AGENTS.md §13）：PATCH 正文 + spec-v 自增 + 可选【SPEC UPDATE】通知评论。
+    顺序契约：先改正文，后留评论；若任务已关闭需返工，先 update 再 reopen。"""
+    iss = gh.issue(number)
+    body = iss.get("body") or ""
+    if body_file:
+        with open(body_file, encoding="utf-8-sig") as f:
+            body = f.read()
+    if append_file:
+        with open(append_file, encoding="utf-8-sig") as f:
+            body = (body.rstrip() + "\n\n" + f.read().strip()).strip() + "\n"
+    if not (body_file or append_file):
+        die("update 需要 --body-file（整体替换）或 --append-file（追加）至少一个")
+    body, ver = _bump_spec_v(body)
+    gh.edit_issue(number, body=body)
+    if comment:
+        gh.add_comment(number, comment if "SPEC UPDATE" in comment
+                       else "【SPEC UPDATE v%d】%s" % (ver, comment))
+    return ver
+
+
+def cmd_update(args):
+    gh = GitHub(resolve_token(args), args.repo)
+    ver = do_update(gh, args.issue, args.body_file, args.append_file, args.comment)
+    if args.json:
+        print(json.dumps({"issue": args.issue, "spec-v": ver}, ensure_ascii=False))
+        return
+    print("✓ #%s 正文已更新（spec-v: %d）%s" % (
+        args.issue, ver, "，通知评论已发布" if args.comment else "（未发通知评论——§13 要求正文改完必须发【SPEC UPDATE】评论）"))
+
+
 # ---------------------------------------------------------------- 自检
 
 def cmd_selftest(args):
@@ -852,6 +902,14 @@ def build_parser():
     s = sub.add_parser("reopen", help="重新打开已关闭任务")
     s.add_argument("--issue", type=int, required=True)
     s.set_defaults(func=cmd_reopen)
+
+    s = sub.add_parser("update", help="需求变更：更新正文（spec-v 自增）+ 可选【SPEC UPDATE】评论（§13）")
+    s.add_argument("--issue", type=int, required=True)
+    s.add_argument("--body-file", help="新正文文件（UTF-8，整体替换）")
+    s.add_argument("--append-file", help="追加内容文件（接到现有正文末尾）")
+    s.add_argument("--comment", help="同时发布的变更通知评论（自动加【SPEC UPDATE vN】前缀）")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_update)
 
     s = sub.add_parser("selftest", help="端到端自检")
     s.set_defaults(func=cmd_selftest)

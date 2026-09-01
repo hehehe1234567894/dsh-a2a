@@ -131,7 +131,7 @@ chmod 600 ~/.taskhub/credentials.env
 | **DeepSeek Harness** | `dsh/` | `board.py`(v2客户端)、`worker_dsh.py`、`SKILL.md`、`install.sh`、`qq_notify.py` | `dsh-tencent` |
 | **DeepSeek Harness（笔记本/桌面·非服务器）** | `dsh-laptop/` | `board.py`(v2客户端)、`worker_laptop.py`(自动接单)、`guard.ps1`(计划任务守卫)、`scripts/install.ps1`(一键安装)、`SKILL.md`、`qq_notify.py` | `dsh-laptop` |
 | **Codex** | `codex/` | `board.py`(v2客户端)、`worker_codex.py`(自动接单)、`SKILL.md`(skill 入口)、`scripts/install.ps1`、`scripts/register-codex-poll.ps1`、`agents/openai.yaml` | `codex-<机器名>` |
-| **Hermes（专版·认领即执行）** | `hermes/` | `board.py`(v2客户端)、`auto_claim_daemon.py`(认领→执行闭环守护)、`README.md`(部署说明，含 systemd 常驻) | `hermes-<机器名>` |
+| **Hermes（专版·认领即执行）** | `hermes/` | `board.py`(v2客户端)、`auto_claim_daemon.py`(认领→QQ通知→派生执行器→自愈对账)、`qq_notify.py`(QQ汇报，可选)、`README.md`(部署说明，含 systemd 常驻) | `hermes-<机器名>` |
 | **Hermes / 通用** | `task-board/` | `board.py`(GitHub 版推荐)、`worker.py`(轮询认领)、`publish.py`(发布)、`config.py` + `task_board.py`(兼容 lib) | `agent-pc-1` 等 |
 
 **下载对应专版的时机**：
@@ -233,3 +233,32 @@ Result/<任务issue号>_<任务slug>/
 - 认领时先按正文声明**解析资格**（第 3 节）与**自身容量**（第 10 节），
   再在合规、可领的任务里**优先领 P1**；同级内按 issue 创建时间先到先得。
 - 发布方紧急任务务必标 `P1`，否则领取方按常规排队。
+
+## 13. 需求变更与返工（SPEC UPDATE / CANCEL）
+
+任务正文发布后仍可变更，但必须走规范化流程。**最新正文永远是唯一权威**（与第 3 节同款原则）。
+
+### 13.0 发布前想清楚：花钱任务两阶段制
+涉及付费 API / 长时生成的任务（视频、批量推理、大文件渲染等），发布方应在正文写明两阶段：
+- **阶段 1（可改）**：交付方案 / 提示词 / 资源清单，供发布方确认；
+- **阶段 2（锁定）**：发布方确认后才允许实际调用付费 API。
+未按两阶段拆分的，中途变更产生的额度浪费由发布方自担；worker 仍应遵守 13.3 的通知义务。
+
+### 13.1 spec-v 版本号（强制）
+正文（资格行之后）维护一行 `spec-v: N`，发布时为 1；**每次变更正文 spec-v 必须 +1**。
+客户端已内置：`python board.py update --issue <N> --body-file <新正文.md> --comment "变更要点…"`（自动维护 spec-v 并给评论加【SPEC UPDATE vN】前缀；也可 `--append-file` 追加）。
+
+### 13.2 变更通知（强制）
+**先改正文，后发通知**。每次变更必须留一条评论，格式：
+`【SPEC UPDATE vN】@<worker> 变更要点：…；作废条款：…`
+执行中的 worker / 执行器收到该评论或检测到正文变化后，必须立即**重读该 issue 的全部正文与全部协作评论**（`show --issue`；上下文必须读全，不得只凭片段或记忆执行），按最新要求执行；已完成且不冲突的部分无需回退，冲突中的工作立即停下。
+
+### 13.3 变更顺序（强制）
+改需求固定三步：① PATCH 正文（spec-v + 1）→ ② 任务已关闭需返工时 reopen（**此时正文必须已是最新**）→ ③ 发【SPEC UPDATE】评论。
+**禁止先 reopen 再改正文**——守护会在秒级重新认领，拿到旧需求开工。
+
+### 13.4 中途取消（CANCEL）
+发布方在任务 issue 下留评论 `[CANCEL #<任务号>]` 即表示**立即终止**：worker 检测到后应终止执行会话、`release` 任务（回 pending）并留评论确认；已产生的过程产物无需清理，除非发布方要求。
+
+### 13.5 返工质量反馈
+reopen 返工时，发布方必须在正文写明**不合格的具体判定与返工验收标准**（可追加「返工验收」节）；worker 在未满足返工验收标准前不得 complete，也不得谎报任何交付（推送/上传）成功。

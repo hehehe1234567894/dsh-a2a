@@ -35,6 +35,7 @@ SIGTERM/SIGINT 干净退出（任务租约到期自动回 pending，不留残余
 """
 import argparse
 import datetime
+import hashlib
 import json
 import os
 import re
@@ -76,6 +77,8 @@ INBOX = os.environ.get("TASKHUB_INBOX", os.path.join(BASE, "inbox", "claims.log"
 IDLE_EXIT_MIN = int(os.environ.get("TASKHUB_IDLE_EXIT_MIN", "0"))  # >0: 空闲 N 分钟自行退出（laptop 省资源；guard 会按需拉起）
 TERMINAL = {"done", "failed", "cancelled"}
 BRACKET = re.compile(r"[【\[]\s*(专属|通用|父)\s*[:：\s]?\s*([^\]】]*)[\]】]")
+CANCEL_MARK = re.compile(r"\[\s*CANCEL\s*#\s*(\d+)\s*\]", re.IGNORECASE)
+BODY_HASH = {}  # issue 号 -> 最近一次见到的正文 sha256（§13 需求变更监听）
 
 EXEC_ENABLED = os.environ.get("TASKHUB_EXEC", "1") == "1"
 EXEC_TIMEOUT_MIN = int(os.environ.get("TASKHUB_EXEC_TIMEOUT_MIN", "60"))
@@ -191,16 +194,107 @@ def parse_eligibility(title, body, labels):
 
 # ── 候选发现与认领（§8 发现 + §10 容量 + §11 退避 + §12 优先）──────
 
-def my_open_claims(gh):
-    """我名下租约仍有效的进行中任务（§10 自查 + 心跳对象）。"""
+def _executor_sid(num):
+    """读执行器 pid 文件里的 web 会话 id（web 模式专用；headless 返回空）。"""
+    try:
+        with open(os.path.join(EXEC_DIR, f"{num}.pid"), encoding="utf-8") as f:
+            return (json.load(f) or {}).get("sid") or ""
+    except Exception:
+        return ""
+
+
+def _inbox_event(entry):
+    """向 inbox/claims.log 追加一条事件（JSON 行）；DSH 插件 claim-wake 会注入会话。"""
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(INBOX)), exist_ok=True)
+        with open(INBOX, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except OSError as e:
+        log("会话落盘失败:", e)
+
+
+def cancel_executor(num):
+    """终止 #num 的执行器（web 会话 cancel / headless 杀进程树），并清理 RUNNING。"""
+    try:
+        with open(os.path.join(EXEC_DIR, f"{num}.pid"), encoding="utf-8") as f:
+            rec = json.load(f) or {}
+    except Exception:
+        rec = {}
+    sid, pid = rec.get("sid") or "", int(rec.get("pid", 0) or 0)
+    try:
+        if sid and executor_web is not None:
+            executor_web.rpc("session.cancel", {"sessionId": sid})
+            log("🛑 已请求取消 web 执行会话 #%s（sid=%s…）" % (num, sid[:20]))
+        elif pid > 0:
+            if os.name == "nt":
+                subprocess.run(["taskkill", "/PID", str(pid), "/F", "/T"],
+                               capture_output=True, timeout=20)
+            elif hasattr(os, "killpg"):
+                os.killpg(pid, 9)
+            else:
+                os.kill(pid, 9)
+            log("🛑 已终止 headless 执行器 #%s（pid=%s）" % (num, pid))
+    except Exception as e:
+        log("取消执行器 #%s 失败:" % num, e)
+    RUNNING.discard(num)
+    try:
+        os.remove(os.path.join(EXEC_DIR, f"{num}.pid"))
+    except OSError:
+        pass
+
+
+def my_open_claims(gh, sp):
+    """我名下租约仍有效的进行中任务（§10 自查 + 心跳对象）。
+
+    顺带完成 §13 两件事（复用本轮已拉取的 comments/body，零额外 API）：
+    - [CANCEL #N] 检测（发布方=issue 作者）→ 取消执行器 + release，任务不计入 mine；
+    - 正文 hash 监听 → 变更即通知执行会话（web 模式 queue prompt）+ 落盘 inbox。"""
     mine = []
     now = board.now_utc()
     for iss in gh.issues(state="open"):
         if "pull_request" in iss:
             continue
-        owner = board.resolve_owner(board.parse_claims(gh.comments(iss["number"])), now)
-        if owner and owner["worker"] == WORKER:
-            mine.append((iss["number"], iss.get("title") or ""))
+        num = iss["number"]
+        cs = gh.comments(num)
+        owner = board.resolve_owner(board.parse_claims(cs), now)
+        if not (owner and owner["worker"] == WORKER):
+            continue
+        title = iss.get("title") or ""
+        author = (iss.get("user") or {}).get("login") or ""
+        if any(CANCEL_MARK.search((c.get("body") or "") or "")
+               and (c.get("user") or {}).get("login") == author for c in cs):
+            log("🛑 #%s 收到发布方 [CANCEL] 标记 → 取消执行并释放（§13.4）" % num)
+            cancel_executor(num)
+            _inbox_event({"time": datetime.datetime.now().astimezone().isoformat(),
+                          "event": "cancelled", "worker": WORKER, "issue": num,
+                          "title": title, "body": "发布方已 [CANCEL]，执行器已终止、任务已释放。"})
+            try:
+                board.do_release(gh, num, WORKER, force=True, state_path=sp, repo=REPO)
+                log("✓ #%s 已释放回 pending" % num)
+            except Exception as e:
+                log("release #%s 失败（下轮重试）:" % num, e)
+            BODY_HASH.pop(num, None)
+            continue
+        h = hashlib.sha256((iss.get("body") or "").encode("utf-8")).hexdigest()
+        old = BODY_HASH.get(num)
+        if old and old != h:
+            log("⚠️ #%s 任务正文已变更（SPEC UPDATE）→ 通知执行会话重读正文（§13）" % num)
+            note = ("【SPEC UPDATE】任务 #%s 的正文/验收标准已被发布方更新，旧要求可能已作废。"
+                    "请立即用 board.py show --issue %s 重读【全部正文与全部评论】（最新正文为唯一权威），"
+                    "按最新要求调整执行；已完成且不冲突的部分无需回退，与新旧要求冲突的部分立即停下。"
+                    % (num, num))
+            sid = _executor_sid(num)
+            if sid and executor_web is not None:
+                try:
+                    executor_web.prompt(sid, note)
+                    log("📤 已向 web 执行会话 #%s 推送 SPEC UPDATE" % num)
+                except Exception as e:
+                    log("SPEC UPDATE 推送失败 #%s:" % num, e)
+            _inbox_event({"time": datetime.datetime.now().astimezone().isoformat(),
+                          "event": "spec-update", "worker": WORKER, "issue": num,
+                          "title": title, "body": note})
+        BODY_HASH[num] = h
+        mine.append((num, title))
     return mine
 
 
@@ -271,6 +365,31 @@ def pick_and_claim(gh, sp, mine_numbers, capacity_left):
 
 # ── 会话回传 / 执行器（认领→执行闭环 + 自愈）──────────────────────
 
+def _issue_context(gh, num, body):
+    """完整任务上下文快照（§13：上下文必须读全）= 正文全文 + 全部协作评论（正序）。"""
+    parts = ["【任务正文（认领时点全文）】", body or "(空)"]
+    try:
+        cs = gh.comments(num) if gh is not None else []
+    except Exception:
+        cs = []
+    if cs:
+        lines = ["【协作评论快照（正序，含发布方更正/反馈——与正文共同构成完整需求）】"]
+        for c in cs:
+            who = (c.get("user") or {}).get("login") or "?"
+            t = ((c.get("created_at") or "")[:19]).replace("T", " ")
+            lines.append("── [%s] %s\n%s" % (who, t, (c.get("body") or "").strip()))
+        text = "\n".join(lines)
+        if len(text) > 8000:
+            text = ("【协作评论快照】(较早部分已截断，完整内容用 board.py show --issue %d 查看)\n"
+                    % num) + text[-8000:]
+        parts.append(text)
+    else:
+        parts.append("【协作评论】（认领时暂无）")
+    parts.append("（本快照是认领时点；执行中正文/评论可能更新——正文含 spec-v 版本号。"
+                 "收到【SPEC UPDATE】或怀疑有变更时，用 board.py show --issue %d 重读全文与评论，以最新正文为唯一权威。" % num)
+    return "\n\n".join(parts)
+
+
 def echo_to_session(claim, elig):
     entry = {
         "time": datetime.datetime.now().astimezone().isoformat(),
@@ -281,8 +400,10 @@ def echo_to_session(claim, elig):
         "eligibility": elig,
         "url": claim["url"],
         "lease_until": claim["lease_until"],
-        "body": claim["body"][:2000],
+        "body": claim["body"][:12000],
     }
+    if len(claim["body"]) > 12000:
+        entry["body"] += "\n(正文超长已截断，执行前务必用 board.py show --issue %s 读取全文与全部评论)" % claim["issue"]
     try:
         os.makedirs(os.path.dirname(os.path.abspath(INBOX)), exist_ok=True)
         with open(INBOX, "a", encoding="utf-8") as f:
@@ -304,24 +425,29 @@ def echo_to_session(claim, elig):
             log("QQ 汇报失败:", e)
 
 
-def spawn_executor(claim):
+def spawn_executor(claim, gh=None):
     """派生 DSH headless 会话真实执行任务并自行 complete/fail。
-    轻量原则：每任务至多一个执行器；pid 文件使守护重启后仍能接管/续管；超时自动回收。"""
+    轻量原则：每任务至多一个执行器；pid 文件使守护重启后仍能接管/续管；超时自动回收。
+    上下文完整性（§13）：prompt 附正文全文 + 全部协作评论快照，不允许执行器只看片段。"""
     n = claim["issue"]
     if EXEC_OFF or n in RUNNING:
         return
     os.makedirs(EXEC_DIR, exist_ok=True)
+    context = _issue_context(gh, n, claim.get("body") or "")
     prompt = (
         f"[taskhub-exec:#{n}] 你是 TaskHub 看板的任务执行器（worker={WORKER}）。"
         f"请独立完成看板任务 #{n}：{claim['title']}\n"
-        f"任务正文：\n{claim['body']}\n\n"
+        f"{context}\n\n"
         "执行要求：\n"
-        "1. 按正文的目标/验收标准真实完成（写文件、算题、查资料等直接动手，不要只给方案）。\n"
-        f"2. 有实体产出时按仓库 AGENTS.md §9 用 Contents API 上传到 Result/{n}_<小写短横线slug>/ 目录。\n"
-        f"3. 完成后务必运行：\"{sys.executable}\" -u \"{os.path.join(BASE, 'board.py')}\" --credentials {CREDS} complete --issue {n} "
+        "1. 先通读上方【任务正文】与【协作评论】再动手——两者共同构成完整需求，以最新正文为唯一权威。\n"
+        "2. 按正文的目标/验收标准真实完成（写文件、算题、查资料等直接动手，不要只给方案）。\n"
+        f"3. 有实体产出时按仓库 AGENTS.md §9 用 Contents API 上传到 Result/{n}_<小写短横线slug>/ 目录。\n"
+        f"4. 完成后务必运行：\"{sys.executable}\" -u \"{os.path.join(BASE, 'board.py')}\" --credentials {CREDS} complete --issue {n} "
         f"--worker {WORKER} --result \"<结果摘要，含 Result/ 路径与交付说明>\"\n"
-        f"4. 无法完成则运行 fail --issue {n} --worker {WORKER} --error \"原因\"，不要静默放弃。\n"
-        "5. 不要发布新任务，不要认领或修改其他 issue，不要动看板协议文件。"
+        f"5. 无法完成则运行 fail --issue {n} --worker {WORKER} --error \"原因\"，不要静默放弃。\n"
+        "6. 不要发布新任务，不要认领或修改其他 issue，不要动看板协议文件。\n"
+        "7. 发布方可能中途更新任务正文/评论（AGENTS.md §13，正文含 spec-v 版本号）："
+        "守护检测到变更会向你推送【SPEC UPDATE】，收到后立即用 board.py show --issue 重读全文与全部评论并按新要求执行。"
     )
     logf = open(os.path.join(EXEC_DIR, f"{n}.log"), "w", encoding="utf-8")
     env = dict(os.environ)
@@ -335,7 +461,10 @@ def spawn_executor(claim):
         if EXEC_WEB and executor_web is not None:
             # web API 模式（推荐）：在 DSH 宿主内创建会话，web 侧边栏实时可见；
             # 会话运行在宿主进程（无 landlock），彻底规避 headless 子进程的 EACCES 崩溃。
-            sid = executor_web.create_session(cwd=BASE, session_id="taskhub-%d" % n)
+            # 本机适配：web 会话 cwd 遵循 TASKHUB_EXEC_CWD（与 headless 分支一致），缺省回退 BASE
+            sid = executor_web.create_session(
+                cwd=os.environ.get("TASKHUB_EXEC_CWD") or BASE,
+                session_id="taskhub-%d" % n)
             executor_web.prompt(sid, prompt)
             with open(os.path.join(EXEC_DIR, f"{n}.pid"), "w", encoding="utf-8") as f:
                 json.dump({"sid": sid, "pid": 0, "ts": int(time.time()), "issue": n}, f)
@@ -469,15 +598,21 @@ def ensure_executors(gh, mine):
         except Exception as e:
             log("读取任务 #%s 失败（下轮重试）:" % num, e)
             continue
-        spawn_executor(claim)  # 成功时内部已 RUNNING.add(n)
+        try:
+            spawn_executor(claim, gh)  # 成功时内部已 RUNNING.add(n)
+        except Exception as e:
+            log("派生执行器失败 #%s（下轮重试）:" % num, e)
 
 
 # ── 主循环 ───────────────────────────────────────────────────────
 
 def one_round(gh, sp, last_hb):
     """跑一轮。返回 True 表示"忙"（名下有任务或本轮有新认领）。"""
-    mine = my_open_claims(gh)
+    mine = my_open_claims(gh, sp)
     mine_numbers = {num for num, _ in mine}
+    for n in list(BODY_HASH.keys()):
+        if n not in mine_numbers:
+            BODY_HASH.pop(n, None)  # 任务已结束/释放 → 停止监听
     for n in list(RUNNING - mine_numbers):  # 已结束任务的执行器记录清理
         RUNNING.discard(n)
         try:
@@ -501,7 +636,7 @@ def one_round(gh, sp, last_hb):
     for claim, elig in claimed:
         echo_to_session(claim, elig)
         if not EXEC_OFF:
-            spawn_executor(claim)
+            spawn_executor(claim, gh)
     ensure_executors(gh, mine)  # 自愈对账：重启/孤儿认领也会被补上执行器
     if not claimed and not mine:
         log("暂无可认领任务（空闲 %d/%d）" % (len(mine), MAX_LOAD))
@@ -510,7 +645,7 @@ def one_round(gh, sp, last_hb):
 
 def main():
     log("worker_all 启动 mode=%s worker=%s poll=%ds max_load=%d lease=%dmin hb>=%dmin "
-        "undeclared=%s exec=%s execmode=%s [契约:§3资格门禁 §10容量 §11退避 §12优先]"
+        "undeclared=%s exec=%s execmode=%s [契约:§3资格门禁 §10容量 §11退避 §12优先 §13变更监听]"
         % (MODE, WORKER, POLL, MAX_LOAD, LEASE_MIN, HB_MIN, UNDECLARED,
            "off" if EXEC_OFF else "on", EXEC_MODE))
     signal.signal(signal.SIGINT, _graceful)
