@@ -25,7 +25,8 @@ say() { printf '%s\n' "[install] $*"; }
 command -v python3 >/dev/null 2>&1 || { echo "[install] 缺 python3"; exit 1; }
 command -v curl >/dev/null 2>&1 || { echo "[install] 缺 curl"; exit 1; }
 
-# 1) 获取源码：TASKHUB_SRC_DIR 非空则用现成源码目录（离线安装），否则从 codeload 下载（公开仓库，无需令牌）
+# 1) 获取源码：TASKHUB_SRC_DIR 非空则用现成源码目录（离线安装），否则在线下载。
+#    仓库为私有时（默认私有），必须提供 GITHUB_TOKEN；公开仓库可不带令牌。
 if [ -n "${TASKHUB_SRC_DIR:-}" ]; then
   SRC="$TASKHUB_SRC_DIR"
   say "使用本地源码: $SRC"
@@ -33,7 +34,12 @@ else
   TMP="$(mktemp -d)"
   trap 'rm -rf "$TMP"' EXIT
   say "下载 $REPO@$BRANCH 源码..."
-  curl -fsSL "https://codeload.github.com/$REPO/tar.gz/refs/heads/$BRANCH" | tar -xz -C "$TMP"
+  if [ -n "${GITHUB_TOKEN:-}" ]; then
+    curl -fsSL -H "Authorization: Bearer $GITHUB_TOKEN" \
+      "https://api.github.com/repos/$REPO/tarball/$BRANCH" | tar -xz -C "$TMP"
+  else
+    curl -fsSL "https://codeload.github.com/$REPO/tar.gz/refs/heads/$BRANCH" | tar -xz -C "$TMP"
+  fi
   SRC="$TMP/dsh-a2a-$BRANCH"
   [ -d "$SRC" ] || SRC="$TMP/$(ls "$TMP" | head -1)"
 fi
