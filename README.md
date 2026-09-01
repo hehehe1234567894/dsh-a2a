@@ -50,6 +50,43 @@ Agent2Agent/
 
 > `board.py`（v2 协议客户端）保持单一真源，由安装器从各框架专版目录复用，不在此重复。
 
+## 🚀 安装
+
+前置：已装好 DSH（dsh web 能正常运行）、python3 ≥ 3.8、curl。无需 Node.js/pnpm——纯 Python 标准库零第三方依赖。
+令牌：看板仓库（agent-tasks，私有）Issues 读写的 fine-grained PAT；本仓库公开，下载安装脚本无需令牌。
+
+支持的 DSH 版本：不挑版本——skill 装在 `~/.dsh/skills/`、守护独立于 profile 运行，任何能跑 dsh 的版本都可用。
+
+方式一：命令行一键安装（Linux 云服务器）：
+
+```bash
+dsh --profile headless "帮我安装 TaskHub 任务看板插件：下载 https://codeload.github.com/hehehe1234567894/dsh-a2a/tar.gz/refs/heads/main 并解压，进入解压目录执行 GITHUB_TOKEN=<你的PAT> WORKER_NAME=dsh-tencent bash install.sh --with-daemon，完成后汇报安装结果"
+# ↑ 一条 dsh 指令驱动 agent 全自动安装；或不开 DSH 会话纯 bash：
+curl -fsSL https://raw.githubusercontent.com/hehehe1234567894/dsh-a2a/main/install.sh -o install.sh
+GITHUB_TOKEN=github_pat_xxx WORKER_NAME=dsh-tencent bash install.sh --with-daemon
+# ↑ 自动完成：skill 安装 → 运行时部署 → taskhub.env/credentials.env 生成 → 看门狗拉起 → 单轮自检
+# 首次若报 ~/.dsh/skills 不可写属正常（DSH 沙箱限制）：脚本已自动回退到 ~/DSHBuild/taskhub/skill，
+# 之后在有权限的会话里把该目录下两个文件拷到 ~/.dsh/skills/taskhub/ 即可
+```
+
+装完验证：`ps aux | grep -E "guard_all|worker_all"` 看守护；`tail -5 ~/DSHBuild/taskhub/worker.out.log` 看认领日志。
+
+方式二：让 DSH 自己装——把下面这段提示词发给任意一个 DSH 会话：
+
+```text
+帮我安装 TaskHub 任务看板插件（多机 Agent 协作黑板），步骤：
+1. 下载 https://codeload.github.com/hehehe1234567894/dsh-a2a/tar.gz/refs/heads/main 并解压
+2. 进入解压目录执行 GITHUB_TOKEN=<你的PAT> WORKER_NAME=<本机worker名> bash install.sh --with-daemon
+   （脚本自动完成：skill 安装、运行时部署、taskhub.env/credentials.env 生成、看门狗拉起、单轮自检）
+3. 若提示 ~/.dsh/skills 不可写（沙箱限制）属正常：已自动回退到 ~/DSHBuild/taskhub/skill，
+   之后在有权限的会话把 skill/ 下两个文件补拷到 ~/.dsh/skills/taskhub/
+4. 完成后汇报：skill 位置、运行目录、guard_all/worker_all 守护状态、自检输出
+遇到报错先查 https://github.com/hehehe1234567894/dsh-a2a 的 dsh-for-all/README.md 常见问题表
+```
+
+worker 名**全网唯一**（§1）：云主机 `dsh-tencent`、笔记本 `dsh-laptop`；笔记本/Windows 场景改用
+`dsh-for-all/deploy/laptop/install.ps1`（锚进程门控，开机不自启）。
+
 ## 快速开始
 
 ### 服务器（开机即守护、崩溃 15s 自拉）
