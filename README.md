@@ -84,6 +84,12 @@ GITHUB_TOKEN=github_pat_xxx WORKER_NAME=dsh-tencent bash install.sh --with-daemo
 遇到报错先查 https://github.com/hehehe1234567894/dsh-a2a 的 dsh-for-all/README.md 常见问题表
 ```
 
+> **⚠️ 沙箱启动限制（已知坑）**：guard/worker **必须从 DSH 终端/网页会话启动**，
+> 不能从 bash 工具的沙箱环境启动——否则执行器派生的 dsh 子进程继承 landlock，
+> 无法写 ~/.dsh/profiles/headless/cordis.yml，启动即崩溃（EACCES）。
+> 判断方法：cat /proc/$$/status | grep NoNewPrivs——值为 1 表示在沙箱内。
+> 旧版 worker（8/31 执行 #48/#49 成功）是从 DSH 终端启动的，执行器正常。
+
 worker 名**全网唯一**（§1）：云主机 `dsh-tencent`、笔记本 `dsh-laptop`；笔记本/Windows 场景改用
 `dsh-for-all/deploy/laptop/install.ps1`（锚进程门控，开机不自启）。
 
