@@ -54,13 +54,15 @@ def api_available(base=None):
         return False
 
 
-def create_session(cwd=None, session_id=None, base=None):
-    """创建会话。session_id 可指定（幂等自愈：同名会话存在则返回既有）。"""
+def create_session(cwd=None, session_id=None, base=None, **extra):
+    """创建会话。session_id 可指定（幂等自愈：同名会话存在则返回既有）；extra 透传
+    其余 payload 字段（如 agentPreset，§10.1 执行空间预配映射）。"""
     payload = {}
     if cwd:
         payload["cwd"] = cwd
     if session_id:
         payload["sessionId"] = session_id
+    payload.update(extra)
     v = rpc("session.create", payload, base=base)
     return v.get("sessionId")
 
@@ -85,6 +87,17 @@ def session_status(session_id, base=None):
             vals = (s.get("projections") or {}).get("values") or {}
             return (bool(s.get("running")), vals.get("title"), s.get("updatedAt"))
     return False, None, None
+
+
+def models(session_id, base=None):
+    """会话可用模型目录：{current, groups:[{id,name,models:[{id,name,...}]}], failures}。"""
+    return rpc("session.models", {"sessionId": session_id}, base=base) or {}
+
+
+def select_model(session_id, provider, model, base=None):
+    """切换会话模型（§10.1 任务级『模型：』声明）。"""
+    return rpc("session.selectModel", {"sessionId": session_id,
+                                       "provider": provider, "model": model}, base=base)
 
 
 if __name__ == "__main__":

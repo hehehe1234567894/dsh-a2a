@@ -58,8 +58,13 @@ except Exception:
 BASE = os.path.dirname(os.path.abspath(__file__))
 WORKER = os.environ.get("TASKHUB_WORKER", "dsh-all")
 REPO = os.environ.get("TASKHUB_REPO", "hehehe1234567894/agent-tasks")
+# §11 弱机档：TASKHUB_PROFILE=lite 时轮询缺省 60s（TASKHUB_POLL 可覆盖），降 API 消耗与功耗；功能不删减
+EXEC_PROFILE = os.environ.get("TASKHUB_PROFILE", "full").strip().lower()
+if EXEC_PROFILE not in ("full", "lite"):
+    EXEC_PROFILE = "full"
 CREDS = os.environ.get("TASKHUB_CREDENTIALS", os.path.join(BASE, "credentials.env"))
-POLL = max(15, int(os.environ.get("TASKHUB_POLL", "15")))          # §11: >= 15s
+POLL = max(15, int(os.environ.get(
+    "TASKHUB_POLL", "60" if EXEC_PROFILE == "lite" else "15")))          # §11: >= 15s
 MAX_LOAD = int(os.environ.get("TASKHUB_MAX_LOAD", "1"))            # §10
 LEASE_MIN = int(os.environ.get("TASKHUB_LEASE_MIN", "30"))
 HB_MIN = int(os.environ.get("TASKHUB_HEARTBEAT_MIN", "20"))
@@ -84,6 +89,21 @@ EXEC_ENABLED = os.environ.get("TASKHUB_EXEC", "1") == "1"
 EXEC_TIMEOUT_MIN = int(os.environ.get("TASKHUB_EXEC_TIMEOUT_MIN", "60"))
 EXEC_DIR = os.path.join(BASE, "executions")
 RUNNING = set()  # 已派生/接管执行会话、尚未结束的 issue 号
+# §10.1 执行分流：任务正文可声明『执行模式：串行/并行』；未声明任务用机器默认
+# （TASKHUB_EXEC_SERIAL=1 时缺省串行，否则缺省并行）。串行任务不单独拉执行器，
+# 而是把完整指令通过 DSH 会话原生队列（executor_web.prompt，mode=queue）追加进
+# 当前运行中的执行会话按序执行，防止并发执行器拖垮弱机。
+EXEC_SERIAL = os.environ.get("TASKHUB_EXEC_SERIAL", "0") == "1"
+QUEUED = {}  # issue -> 承载其排队指令的执行器 issue 号
+EXEC_MODE_RE = re.compile(r"执行模式[:：]\s*(串行|并行)")
+EXEC_SPACE_RE = re.compile(r"执行空间[:：]\s*(只读|工作区|完全)")
+EXEC_MODEL_RE = re.compile(r"模型[:：]\s*([A-Za-z0-9._/\-]+)")
+# 执行空间→agentPreset 预配（web 会话无会话级沙箱字段；TASKHUB_SPACE_PRESET=只读:xxx,完全:yyy）
+SPACE_PRESETS = {}
+for _pair in os.environ.get("TASKHUB_SPACE_PRESET", "").split(","):
+    if ":" in _pair:
+        _k, _v = _pair.split(":", 1)
+        SPACE_PRESETS[_k.strip()] = _v.strip()
 
 
 def _find_dsh():
@@ -251,8 +271,14 @@ def my_open_claims(gh, sp):
     - 正文 hash 监听 → 变更即通知执行会话（web 模式 queue prompt）+ 落盘 inbox。"""
     mine = []
     now = board.now_utc()
+    mine_label = "claimed-by-%s" % WORKER
     for iss in gh.issues(state="open"):
         if "pull_request" in iss:
+            continue
+        # §性能：只对带 claimed-by-<我> 标签的任务拉评论（labels 随 issues 列表免费返回）。
+        # 非我名下的 open issue（公告/他人任务/待领候选）不再逐个拉评论——认领竞速
+        # 由 claim 流程按资格门禁另行处理，租约到期的接管也由 try_claim 按需拉取。
+        if mine_label not in {l.get("name") for l in iss.get("labels", [])}:
             continue
         num = iss["number"]
         cs = gh.comments(num)
@@ -425,18 +451,35 @@ def echo_to_session(claim, elig):
             log("QQ 汇报失败:", e)
 
 
-def spawn_executor(claim, gh=None):
-    """派生 DSH headless 会话真实执行任务并自行 complete/fail。
-    轻量原则：每任务至多一个执行器；pid 文件使守护重启后仍能接管/续管；超时自动回收。
-    上下文完整性（§13）：prompt 附正文全文 + 全部协作评论快照，不允许执行器只看片段。"""
-    n = claim["issue"]
-    if EXEC_OFF or n in RUNNING:
-        return
-    os.makedirs(EXEC_DIR, exist_ok=True)
-    context = _issue_context(gh, n, claim.get("body") or "")
-    prompt = (
+def _exec_mode(body):
+    """任务级执行分流（§10.1）：正文『执行模式：串行/并行』声明优先，未声明用机器默认。"""
+    m = EXEC_MODE_RE.search(body or "")
+    if m:
+        return "serial" if m.group(1) == "串行" else "parallel"
+    return "serial" if EXEC_SERIAL else "parallel"
+
+
+def _slot_sid():
+    """当前在跑的执行会话 (holder_issue, sid)；串行任务排队的目标槽位。
+    以 pid 存活（executor_state）为准——DSH 会话在两条 prompt 间隙会短暂 idle，
+    不能用 running 标志判断槽位是否被占。"""
+    for n in sorted(RUNNING):
+        st, _age = executor_state(n)
+        if st != "alive":
+            continue
+        try:
+            with open(os.path.join(EXEC_DIR, f"{n}.pid"), encoding="utf-8") as f:
+                sid = (json.load(f) or {}).get("sid") or ""
+        except Exception:
+            sid = ""
+        return n, sid
+    return None, None
+
+
+def _executor_prompt(n, title, context):
+    return (
         f"[taskhub-exec:#{n}] 你是 TaskHub 看板的任务执行器（worker={WORKER}）。"
-        f"请独立完成看板任务 #{n}：{claim['title']}\n"
+        f"请独立完成看板任务 #{n}：{title}\n"
         f"{context}\n\n"
         "执行要求：\n"
         "1. 先通读上方【任务正文】与【协作评论】再动手——两者共同构成完整需求，以最新正文为唯一权威。\n"
@@ -449,6 +492,69 @@ def spawn_executor(claim, gh=None):
         "7. 发布方可能中途更新任务正文/评论（AGENTS.md §13，正文含 spec-v 版本号）："
         "守护检测到变更会向你推送【SPEC UPDATE】，收到后立即用 board.py show --issue 重读全文与全部评论并按新要求执行。"
     )
+
+
+def _apply_task_model(sid, body, n):
+    """§10.1 任务级『模型：』声明：按会话模型目录解析 provider 后 selectModel；失败保留默认并记录。"""
+    m = EXEC_MODEL_RE.search(body or "")
+    if not m:
+        return
+    want = m.group(1)
+    try:
+        cat = executor_web.models(sid)
+        provider = model = None
+        for g in cat.get("groups", []):
+            gid = g.get("id", "")
+            for mm in g.get("models", []):
+                mid = mm.get("id", "")
+                if mid == want or mid.endswith(want) or want == "%s/%s" % (gid, mid):
+                    provider, model = gid, mid
+                    break
+            if provider:
+                break
+        if provider:
+            executor_web.select_model(sid, provider, model)
+            log("🎛 #%s 执行会话模型已切换：%s/%s" % (n, provider, model))
+        else:
+            log("⚠️ #%s 声明的模型 %r 不在会话模型目录中，保留机器默认" % (n, want))
+    except Exception as e:
+        log("模型选择失败 #%s（保留默认）:" % n, e)
+
+
+def spawn_executor(claim, gh=None):
+    """派生 DSH headless 会话真实执行任务并自行 complete/fail。
+    轻量原则：每任务至多一个执行器；pid 文件使守护重启后仍能接管/续管；超时自动回收。
+    执行分流（§10.1）：正文『执行模式：串行』的任务排队进当前执行会话（DSH 原生 queue），
+    『并行』或未声明（且机器未开缺省串行）的任务独立拉起执行器。
+    声明了『模型：/执行空间：』的任务与串行排队互斥（排队共用承载会话运行时）→ 独立执行器。
+    上下文完整性（§13）：prompt 附正文全文 + 全部协作评论快照，不允许执行器只看片段。"""
+    n = claim["issue"]
+    body = claim.get("body") or ""
+    if EXEC_OFF or n in RUNNING:
+        return
+    serial = _exec_mode(body) == "serial"
+    if serial and (EXEC_MODEL_RE.search(body) or EXEC_SPACE_RE.search(body)):
+        log("🔀 #%s 声明了模型/执行空间，与串行排队互斥（排队共用承载会话运行时）→ 独立执行器" % n)
+        serial = False
+    if serial:
+        holder, sid = _slot_sid()
+        if holder is not None:
+            if n in QUEUED:
+                return  # 已排队，静默等待按序执行
+            if executor_web is None:
+                log("⏳ #%s 串行模式但无 web 通道，等待执行器空位…" % n)
+                return
+            try:
+                executor_web.prompt(sid, _executor_prompt(n, claim.get("title") or "",
+                                                          _issue_context(gh, n, body)))
+                QUEUED[n] = holder
+                log("🔗 #%s 串行排队 → 会话 %s…（DSH 原生 queue，按序执行）" % (n, sid[:24]))
+            except Exception as e:
+                log("串行排队失败 #%s（下轮重试）:" % n, e)
+            return
+    os.makedirs(EXEC_DIR, exist_ok=True)
+    context = _issue_context(gh, n, body)
+    prompt = _executor_prompt(n, claim.get("title") or "", context)
     logf = open(os.path.join(EXEC_DIR, f"{n}.log"), "w", encoding="utf-8")
     env = dict(os.environ)
     env["PATH"] = CHILD_PATH
@@ -462,9 +568,17 @@ def spawn_executor(claim, gh=None):
             # web API 模式（推荐）：在 DSH 宿主内创建会话，web 侧边栏实时可见；
             # 会话运行在宿主进程（无 landlock），彻底规避 headless 子进程的 EACCES 崩溃。
             # 本机适配：web 会话 cwd 遵循 TASKHUB_EXEC_CWD（与 headless 分支一致），缺省回退 BASE
+            space = EXEC_SPACE_RE.search(body)
+            preset = SPACE_PRESETS.get(space.group(1)) if space else None
+            if space and not preset:
+                log("ℹ️ #%s 执行空间 %s 未预配 agentPreset（TASKHUB_SPACE_PRESET），按宿主策略运行 + prompt 级约束" % (n, space.group(1)))
+                prompt += ("\n\n【执行空间约束】发布方声明执行空间=%s：仅在完成任务所必需的范围内读写，"
+                           "不得触碰范围外文件或执行破坏性操作；该约束为提示级，宿主策略以机器配置为准。" % space.group(1))
             sid = executor_web.create_session(
                 cwd=os.environ.get("TASKHUB_EXEC_CWD") or BASE,
-                session_id="taskhub-%d" % n)
+                session_id="taskhub-%d" % n,
+                **({"agentPreset": preset} if preset else {}))
+            _apply_task_model(sid, body, n)
             executor_web.prompt(sid, prompt)
             with open(os.path.join(EXEC_DIR, f"{n}.pid"), "w", encoding="utf-8") as f:
                 json.dump({"sid": sid, "pid": 0, "ts": int(time.time()), "issue": n}, f)
@@ -576,6 +690,8 @@ def ensure_executors(gh, mine):
     if EXEC_OFF:
         return
     for num, _lease in mine:
+        if num in QUEUED:
+            continue  # 串行排队中，由承载会话按序执行
         if num in RUNNING:
             st, age = executor_state(num)
             if st == "timeout":
@@ -613,6 +729,9 @@ def one_round(gh, sp, last_hb):
     for n in list(BODY_HASH.keys()):
         if n not in mine_numbers:
             BODY_HASH.pop(n, None)  # 任务已结束/释放 → 停止监听
+    for n, holder in list(QUEUED.items()):
+        if n not in mine_numbers or holder not in RUNNING:
+            QUEUED.pop(n, None)  # 任务完成或承载会话已结束 → 未完成者后续轮次重新分流
     for n in list(RUNNING - mine_numbers):  # 已结束任务的执行器记录清理
         RUNNING.discard(n)
         try:
@@ -644,10 +763,10 @@ def one_round(gh, sp, last_hb):
 
 
 def main():
-    log("worker_all 启动 mode=%s worker=%s poll=%ds max_load=%d lease=%dmin hb>=%dmin "
-        "undeclared=%s exec=%s execmode=%s [契约:§3资格门禁 §10容量 §11退避 §12优先 §13变更监听]"
-        % (MODE, WORKER, POLL, MAX_LOAD, LEASE_MIN, HB_MIN, UNDECLARED,
-           "off" if EXEC_OFF else "on", EXEC_MODE))
+    log("worker_all 启动 mode=%s worker=%s profile=%s poll=%ds max_load=%d lease=%dmin hb>=%dmin "
+        "undeclared=%s exec=%s execmode=%s exec_serial=%s [契约:§3资格门禁 §10容量+分流 §11退避 §12优先 §13变更监听]"
+        % (MODE, WORKER, EXEC_PROFILE, POLL, MAX_LOAD, LEASE_MIN, HB_MIN, UNDECLARED,
+           "off" if EXEC_OFF else "on", EXEC_MODE, "on" if EXEC_SERIAL else "off"))
     signal.signal(signal.SIGINT, _graceful)
     if hasattr(signal, "SIGTERM"):
         signal.signal(signal.SIGTERM, _graceful)
