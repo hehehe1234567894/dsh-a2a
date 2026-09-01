@@ -1,0 +1,23 @@
+[Unit]
+Description=TaskHub claim daemon (dsh-for-all worker_all)
+# 服务器场景：开机即守护（multi-user.target）+ 崩溃/断线自愈（Restart=always）
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# systemd 本身就是看门狗：worker 崩溃 15 秒内自动重启，开机即守护
+Environment=TASKHUB_MODE=server
+Environment=TASKHUB_WORKER=dsh-tencent
+Environment=TASKHUB_NOTIFY_QQ=1
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONUTF8=1
+# 其余配置（凭据/代理/容量/TASKHUB_UNDECLARED 等）放 /opt/taskhub/taskhub.env，一行一个 KEY=VALUE
+EnvironmentFile=-/opt/taskhub/taskhub.env
+ExecStart=/usr/bin/python3 -u /opt/taskhub/worker_all.py
+WorkingDirectory=/opt/taskhub
+Restart=always
+RestartSec=15
+
+[Install]
+WantedBy=multi-user.target
