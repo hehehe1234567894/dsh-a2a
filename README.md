@@ -55,20 +55,24 @@ Agent2Agent/
 ## 🚀 安装
 
 前置：已装好 DSH（dsh web 能正常运行）、python3 ≥ 3.8、curl。无需 Node.js/pnpm——纯 Python 标准库零第三方依赖。
-令牌：看板仓库（agent-tasks）Issues 读写的 fine-grained PAT；**本仓库 dsh-a2a 默认私有**，下载源码同样需要该令牌（install.sh 已自动带认证；公开仓库场景仍可免令牌）。
+令牌：看板仓库（agent-tasks）Issues 读写的 fine-grained PAT——**仅在接入看板时需要**（安装代码无需令牌，本仓库已公开；可安装后再补写）。
 
 支持的 DSH 版本：不挑版本——skill 装在 `~/.dsh/skills/`、守护独立于 profile 运行，任何能跑 dsh 的版本都可用。
 
-方式一：命令行一键安装（Linux 云服务器）：
+方式一：一行 bash 一键安装（Linux，推荐）
 
 ```bash
-dsh --profile headless "帮我安装 TaskHub 任务看板插件：下载 https://codeload.github.com/hehehe1234567894/dsh-a2a/tar.gz/refs/heads/main 并解压，进入解压目录执行 GITHUB_TOKEN=<你的PAT> WORKER_NAME=dsh-tencent bash install.sh --with-daemon，完成后汇报安装结果"
-# ↑ 一条 dsh 指令驱动 agent 全自动安装；或不开 DSH 会话纯 bash：
-curl -fsSL https://raw.githubusercontent.com/hehehe1234567894/dsh-a2a/main/install.sh -o install.sh
-GITHUB_TOKEN=github_pat_xxx WORKER_NAME=dsh-tencent bash install.sh --with-daemon
-# ↑ 自动完成：skill 安装 → 运行时部署 → taskhub.env/credentials.env 生成 → 看门狗拉起 → 单轮自检
+curl -fsSL https://raw.githubusercontent.com/hehehe1234567894/dsh-a2a/main/install.sh | WORKER_NAME=dsh-tencent bash -s -- --with-daemon
+# 接入看板时加令牌（可后补）：GITHUB_TOKEN=github_pat_xxx 前缀即可
+# 自动完成：skill 安装 → 运行时部署 → taskhub.env 生成 → 看门狗拉起 → 单轮自检
 # 首次若报 ~/.dsh/skills 不可写属正常（DSH 沙箱限制）：脚本已自动回退到 ~/DSHBuild/taskhub/skill，
 # 之后在有权限的会话里把该目录下两个文件拷到 ~/.dsh/skills/taskhub/ 即可
+```
+
+DSH 机器也可以用一条 dsh 指令驱动 agent 全自动安装：
+
+```bash
+dsh --profile headless "帮我安装 TaskHub 任务看板插件：下载 https://codeload.github.com/hehehe1234567894/dsh-a2a/tar.gz/refs/heads/main 并解压，进入解压目录执行 WORKER_NAME=dsh-tencent bash install.sh --with-daemon（如接入看板则加 GITHUB_TOKEN=<你的PAT>），完成后汇报安装结果"
 ```
 
 装完验证：`ps aux | grep -E "guard_all|worker_all"` 看守护；`tail -5 ~/DSHBuild/taskhub/worker.out.log` 看认领日志。
