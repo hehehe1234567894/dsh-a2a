@@ -94,8 +94,9 @@ RUNNING = set()  # 已派生/接管执行会话、尚未结束的 issue 号
 # 而是把完整指令通过 DSH 会话原生队列（executor_web.prompt，mode=queue）追加进
 # 当前运行中的执行会话按序执行，防止并发执行器拖垮弱机。
 EXEC_SERIAL = os.environ.get("TASKHUB_EXEC_SERIAL", "0") == "1"
-QUEUED = {}  # issue -> 承载其排队指令的执行器 issue 号
-EXEC_MODE_RE = re.compile(r"执行模式[:：]\s*(串行|并行)")
+QUEUED = {}       # issue -> 承载其排队/插队指令的会话 sid（防重复 push 的幂等标记）
+QUEUED_LOST = {}  # issue -> 会话查无次数（连续 2 次确认会话不存在才判定 prompt 丢失）
+EXEC_MODE_RE = re.compile(r"执行模式[:：]\s*(串行|并行|插队)")
 EXEC_SPACE_RE = re.compile(r"执行空间[:：]\s*(只读|工作区|完全)")
 EXEC_MODEL_RE = re.compile(r"模型[:：]\s*([A-Za-z0-9._/\-]+)")
 # 执行空间→agentPreset 预配（web 会话无会话级沙箱字段；TASKHUB_SPACE_PRESET=只读:xxx,完全:yyy）
@@ -296,7 +297,13 @@ def my_open_claims(gh, sp):
                           "title": title, "body": "发布方已 [CANCEL]，执行器已终止、任务已释放。"})
             try:
                 board.do_release(gh, num, WORKER, force=True, state_path=sp, repo=REPO)
-                log("✓ #%s 已释放回 pending" % num)
+                # 终态化：打 cancelled 标签（TERMINAL）——防止 release 回 pending 后被
+                # 重新认领→又发现 CANCEL 评论→再释放的横跳循环刷 API。
+                cur = [l.get("name") for l in (gh.issue(num).get("labels") or [])]
+                keep = [l for l in cur
+                        if l not in ("pending", "claimed") and not l.startswith("claimed-by-")]
+                gh.request("PATCH", "/issues/%d" % num, {"labels": keep + ["cancelled"]})
+                log("✓ #%s 已释放并打 cancelled 终态标签（防重复认领横跳）" % num)
             except Exception as e:
                 log("release #%s 失败（下轮重试）:" % num, e)
             BODY_HASH.pop(num, None)
@@ -324,8 +331,10 @@ def my_open_claims(gh, sp):
     return mine
 
 
-def candidates(gh, now):
-    """候选 = open、非 PR、未终止、无主、非公告（不依赖 pending 标签，兼容漏打标签的任务）。"""
+def candidates(gh, now, mine_numbers=frozenset()):
+    """候选 = open、非 PR、未终止、无主、非公告（不依赖 pending 标签，兼容漏打标签的任务）。
+    §性能：资格门禁前置（§3）——他人专属、未领父任务、无法解析资格的任务永远不可领，
+    不为它们拉评论查持有者；仅对"我可领"的任务查无主。"""
     out, held = [], 0
     for iss in gh.issues(state="open"):
         if "pull_request" in iss:
@@ -336,6 +345,13 @@ def candidates(gh, now):
         t = (iss.get("title") or "").strip().lstrip("\ufeff")
         if t.startswith("[公告]") or "documentation" in labels:
             continue
+        elig = parse_eligibility(t, iss.get("body"), sorted(labels))
+        if elig is None:
+            continue  # 资格无法解析 → 一律不可领（§3 宁可错过不可误抢）
+        if elig["type"] == "专属" and elig["worker"] != WORKER:
+            continue  # 他人专属 → 严禁认领（§3 硬性规则）
+        if elig["type"] == "父" and elig["parent"] not in mine_numbers:
+            continue  # 未领父任务 → 禁领子任务（§3 硬性规则）
         owner = board.resolve_owner(board.parse_claims(gh.comments(iss["number"])), now)
         if owner:
             held += 1
@@ -349,7 +365,7 @@ def candidates(gh, now):
 
 
 def pick_and_claim(gh, sp, mine_numbers, capacity_left):
-    cands, held = candidates(gh, board.now_utc())
+    cands, held = candidates(gh, board.now_utc(), mine_numbers)
     claimed, fails, skipped = [], 0, 0
     for iss in cands:
         labels = [lb["name"] for lb in iss.get("labels", [])]
@@ -452,10 +468,12 @@ def echo_to_session(claim, elig):
 
 
 def _exec_mode(body):
-    """任务级执行分流（§10.1）：正文『执行模式：串行/并行』声明优先，未声明用机器默认。"""
+    """任务级执行分流（§10.1）：正文『执行模式：串行/插队/并行』声明优先，未声明用机器默认。
+    串行=排队进当前执行会话按序执行；插队=打断当前轮次立即接管（紧急任务专用）；
+    并行=独立执行器。"""
     m = EXEC_MODE_RE.search(body or "")
     if m:
-        return "serial" if m.group(1) == "串行" else "parallel"
+        return {"串行": "serial", "插队": "barge", "并行": "parallel"}[m.group(1)]
     return "serial" if EXEC_SERIAL else "parallel"
 
 
@@ -521,36 +539,53 @@ def _apply_task_model(sid, body, n):
         log("模型选择失败 #%s（保留默认）:" % n, e)
 
 
+def _barge_aftercare(holder, sid):
+    """插队善后指令：被打断的会话随后自动补跑其名下任务（§10.1）。"""
+    held = [holder] + sorted(k for k, v in QUEUED.items() if v == sid)
+    return ("【插队善后】刚才有一个更高优先级任务紧急插队，你当前的执行轮次被打断。"
+            "请逐个检查你在 TaskHub 名下的任务（%s）：对每个任务先用 board.py show --issue <N> "
+            "重读最新正文与全部评论（§13 上下文必须读全），若未被 [CANCEL] 且未完成，"
+            "继续按最新要求执行并正常 complete/fail。" % ", ".join("#%s" % x for x in held))
+
+
 def spawn_executor(claim, gh=None):
     """派生 DSH headless 会话真实执行任务并自行 complete/fail。
     轻量原则：每任务至多一个执行器；pid 文件使守护重启后仍能接管/续管；超时自动回收。
     执行分流（§10.1）：正文『执行模式：串行』的任务排队进当前执行会话（DSH 原生 queue），
-    『并行』或未声明（且机器未开缺省串行）的任务独立拉起执行器。
-    声明了『模型：/执行空间：』的任务与串行排队互斥（排队共用承载会话运行时）→ 独立执行器。
+    『插队』打断当前轮次立即接管（会话随后自动补跑被打断任务），『并行』或未声明
+    （且机器未开缺省串行）的任务独立拉起执行器。
+    声明了『模型：/执行空间：』的任务与共用会话分流互斥（共用承载会话运行时）→ 独立执行器。
     上下文完整性（§13）：prompt 附正文全文 + 全部协作评论快照，不允许执行器只看片段。"""
     n = claim["issue"]
     body = claim.get("body") or ""
     if EXEC_OFF or n in RUNNING:
         return
-    serial = _exec_mode(body) == "serial"
-    if serial and (EXEC_MODEL_RE.search(body) or EXEC_SPACE_RE.search(body)):
-        log("🔀 #%s 声明了模型/执行空间，与串行排队互斥（排队共用承载会话运行时）→ 独立执行器" % n)
-        serial = False
-    if serial:
+    mode = _exec_mode(body)
+    if mode in ("serial", "barge") and (EXEC_MODEL_RE.search(body) or EXEC_SPACE_RE.search(body)):
+        log("🔀 #%s 声明了模型/执行空间，与共用会话分流互斥（排队/插队共用承载会话运行时）→ 独立执行器" % n)
+        mode = "parallel"
+    if mode in ("serial", "barge"):
         holder, sid = _slot_sid()
         if holder is not None:
             if n in QUEUED:
-                return  # 已排队，静默等待按序执行
+                return  # 已排队/已插队，静默等待
             if executor_web is None:
                 log("⏳ #%s 串行模式但无 web 通道，等待执行器空位…" % n)
                 return
             try:
-                executor_web.prompt(sid, _executor_prompt(n, claim.get("title") or "",
-                                                          _issue_context(gh, n, body)))
-                QUEUED[n] = holder
-                log("🔗 #%s 串行排队 → 会话 %s…（DSH 原生 queue，按序执行）" % (n, sid[:24]))
+                ctx_prompt = _executor_prompt(n, claim.get("title") or "",
+                                              _issue_context(gh, n, body))
+                if mode == "barge":
+                    executor_web.cancel(sid)  # ⚡ 打断当前轮次
+                    executor_web.prompt(sid, ctx_prompt)
+                    executor_web.prompt(sid, _barge_aftercare(holder, sid))  # 队列第二位：善后
+                    log("⚡ #%s 紧急插队 → 已打断会话 %s…，立即接管（原任务已排善后指令）" % (n, sid[:24]))
+                else:
+                    executor_web.prompt(sid, ctx_prompt)
+                    log("🔗 #%s 串行排队 → 会话 %s…（DSH 原生 queue，按序执行）" % (n, sid[:24]))
+                QUEUED[n] = sid  # 幂等标记：排队/插队期间绝不重复 push（清理见 one_round）
             except Exception as e:
-                log("串行排队失败 #%s（下轮重试）:" % n, e)
+                log("串行/插队失败 #%s（下轮重试）:" % n, e)
             return
     os.makedirs(EXEC_DIR, exist_ok=True)
     context = _issue_context(gh, n, body)
@@ -627,12 +662,14 @@ def executor_state(n):
         return None, 0
     pid, ts = int(rec.get("pid", 0)), int(rec.get("ts", 0))
     sid = rec.get("sid") or ""
-    if sid:  # web API 执行器：按会话 running 状态判定
-        running, _title, _upd = (executor_web.session_status(sid)
-                                 if executor_web is not None else (False, None, None))
+    if sid:  # web API 执行器：按会话存在性判定
+        ex = executor_web.session_exists(sid) if executor_web is not None else None
         age = int(time.time() - ts)
-        if not running:
-            return "dead", age  # 会话结束（完成或崩溃）→ ensure_executors 按任务状态重派生
+        if ex is False:
+            return "dead", age  # 确认不在会话列表 → ensure_executors 按任务状态重派生
+        # ex=True（在列，无论 running/无标题——刚创建的会话两者皆空）或 None（查询失败，
+        # 网络抖动）一律不判死：启动窗口/排队间隙误判 dead 会导致同 sessionId 重复派发
+        # prompt（"同一提示词多次排队"的根因）。超时由 age 兜底回收。
         if age >= EXEC_TIMEOUT_MIN * 60:
             try:  # 超时：请求取消会话
                 executor_web.rpc("session.cancel", {"sessionId": sid})
@@ -729,9 +766,25 @@ def one_round(gh, sp, last_hb):
     for n in list(BODY_HASH.keys()):
         if n not in mine_numbers:
             BODY_HASH.pop(n, None)  # 任务已结束/释放 → 停止监听
-    for n, holder in list(QUEUED.items()):
-        if n not in mine_numbers or holder not in RUNNING:
-            QUEUED.pop(n, None)  # 任务完成或承载会话已结束 → 未完成者后续轮次重新分流
+    for n, sid in list(QUEUED.items()):
+        if n not in mine_numbers:
+            QUEUED.pop(n, None)
+            QUEUED_LOST.pop(n, None)  # 任务已结束（complete/fail/release）→ 幂等标记随之清除
+            continue
+        # 与 holder 的 RUNNING 状态解耦：holder 任务完成≠会话死亡，队列里的 prompt 仍会执行。
+        # 仅当会话连续 2 次确认不在列（prompt 真丢失）才清除标记、下轮重新分流；
+        # 查询失败（None）不计丢失，避免网络抖动触发重复 push。
+        ex = executor_web.session_exists(sid) if executor_web is not None else None
+        if ex is True:
+            QUEUED_LOST.pop(n, None)
+        elif ex is None:
+            pass
+        else:
+            QUEUED_LOST[n] = QUEUED_LOST.get(n, 0) + 1
+            if QUEUED_LOST[n] >= 2:
+                QUEUED.pop(n, None)
+                QUEUED_LOST.pop(n, None)
+                log("⚠️ #%s 的排队目标会话已不存在（prompt 丢失），下轮重新分流" % n)
     for n in list(RUNNING - mine_numbers):  # 已结束任务的执行器记录清理
         RUNNING.discard(n)
         try:

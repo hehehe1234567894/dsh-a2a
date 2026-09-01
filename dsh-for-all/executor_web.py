@@ -76,6 +76,11 @@ def prompt(session_id, text, base=None):
     }, base=base)
 
 
+def cancel(session_id, base=None):
+    """打断会话当前正在执行的轮次（§10.1 紧急插队用）。"""
+    return rpc("session.cancel", {"sessionId": session_id}, base=base)
+
+
 def session_status(session_id, base=None):
     """返回 (running: bool, title: str|None, updatedAt: int|None)。会话不存在 → (False, None, None)。"""
     try:
@@ -87,6 +92,16 @@ def session_status(session_id, base=None):
             vals = (s.get("projections") or {}).get("values") or {}
             return (bool(s.get("running")), vals.get("title"), s.get("updatedAt"))
     return False, None, None
+
+
+def session_exists(session_id, base=None):
+    """三态存在性：True=会话在列（无论 running/title）；False=确认不存在；
+    None=查询失败（网络/API 异常，调用方不得据此判死）。"""
+    try:
+        items = (rpc("session.list", {}, base=base) or {}).get("items", [])
+    except Exception:
+        return None
+    return any(s.get("sessionId") == session_id for s in items)
 
 
 def models(session_id, base=None):
