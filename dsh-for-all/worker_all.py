@@ -47,6 +47,13 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import board  # noqa: E402  与 dsh/ / dsh-laptop/ 同一份 v2 客户端（协议单一真源）
 
+try:  # web API 执行器（会话在 DSH 宿主内运行，web 侧边栏可见，无沙箱 EACCES）
+    import executor_web  # noqa: E402
+    EXEC_WEB = executor_web.api_available()
+except Exception:
+    executor_web = None
+    EXEC_WEB = False
+
 BASE = os.path.dirname(os.path.abspath(__file__))
 WORKER = os.environ.get("TASKHUB_WORKER", "dsh-all")
 REPO = os.environ.get("TASKHUB_REPO", "hehehe1234567894/agent-tasks")
@@ -87,6 +94,7 @@ def _find_dsh():
 
 DSH_BIN = _find_dsh()
 EXEC_OFF = not (DSH_BIN and EXEC_ENABLED)
+EXEC_MODE = "web" if (EXEC_WEB and executor_web is not None) else "headless"
 if os.name == "nt":
     CHILD_PATH = os.environ.get("PATH", "")   # Windows: 继承系统 PATH
 else:
@@ -324,6 +332,17 @@ def spawn_executor(claim):
     except Exception:
         pass
     try:
+        if EXEC_WEB and executor_web is not None:
+            # web API 模式（推荐）：在 DSH 宿主内创建会话，web 侧边栏实时可见；
+            # 会话运行在宿主进程（无 landlock），彻底规避 headless 子进程的 EACCES 崩溃。
+            sid = executor_web.create_session(cwd=BASE, session_id="taskhub-%d" % n)
+            executor_web.prompt(sid, prompt)
+            with open(os.path.join(EXEC_DIR, f"{n}.pid"), "w", encoding="utf-8") as f:
+                json.dump({"sid": sid, "pid": 0, "ts": int(time.time()), "issue": n}, f)
+            RUNNING.add(n)
+            log("🚀 已通过 web API 派生执行会话 #%s（sid=%s…，web 侧边栏可见）" % (n, sid[:20]))
+            return
+        # 回退：headless 子进程模式（web API 不可用时）
         if os.name == "nt":
             # Windows: 复刻 dsh.cmd 的调起方式但绕开 cmd（路径含空格时 cmd /c 引号解析不可靠）：
             # Electron 以 ELECTRON_RUN_AS_NODE=1 直接跑 desktop-cli.js。
@@ -364,6 +383,24 @@ def executor_state(n):
     except Exception:
         return None, 0
     pid, ts = int(rec.get("pid", 0)), int(rec.get("ts", 0))
+    sid = rec.get("sid") or ""
+    if sid:  # web API 执行器：按会话 running 状态判定
+        running, _title, _upd = (executor_web.session_status(sid)
+                                 if executor_web is not None else (False, None, None))
+        age = int(time.time() - ts)
+        if not running:
+            return "dead", age  # 会话结束（完成或崩溃）→ ensure_executors 按任务状态重派生
+        if age >= EXEC_TIMEOUT_MIN * 60:
+            try:  # 超时：请求取消会话
+                executor_web.rpc("session.cancel", {"sessionId": sid})
+            except Exception:
+                pass
+            try:
+                os.remove(pf)
+            except OSError:
+                pass
+            return "timeout", age
+        return "alive", age
     alive = False
     if pid > 0:
         if os.name == "nt":
@@ -473,9 +510,9 @@ def one_round(gh, sp, last_hb):
 
 def main():
     log("worker_all 启动 mode=%s worker=%s poll=%ds max_load=%d lease=%dmin hb>=%dmin "
-        "undeclared=%s exec=%s [契约:§3资格门禁 §10容量 §11退避 §12优先]"
+        "undeclared=%s exec=%s execmode=%s [契约:§3资格门禁 §10容量 §11退避 §12优先]"
         % (MODE, WORKER, POLL, MAX_LOAD, LEASE_MIN, HB_MIN, UNDECLARED,
-           "off" if EXEC_OFF else "on"))
+           "off" if EXEC_OFF else "on", EXEC_MODE))
     signal.signal(signal.SIGINT, _graceful)
     if hasattr(signal, "SIGTERM"):
         signal.signal(signal.SIGTERM, _graceful)
