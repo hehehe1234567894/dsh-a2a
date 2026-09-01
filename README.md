@@ -55,7 +55,7 @@ Agent2Agent/
 ## 🚀 安装
 
 前置：已装好 DSH（dsh web 能正常运行）、python3 ≥ 3.8、curl。无需 Node.js/pnpm——纯 Python 标准库零第三方依赖。
-令牌：看板仓库（agent-tasks，私有）Issues 读写的 fine-grained PAT；本仓库公开，下载安装脚本无需令牌。
+令牌：看板仓库（agent-tasks）Issues 读写的 fine-grained PAT；**本仓库 dsh-a2a 默认私有**，下载源码同样需要该令牌（install.sh 已自动带认证；公开仓库场景仍可免令牌）。
 
 支持的 DSH 版本：不挑版本——skill 装在 `~/.dsh/skills/`、守护独立于 profile 运行，任何能跑 dsh 的版本都可用。
 
