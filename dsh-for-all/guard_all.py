@@ -200,6 +200,29 @@ def anchor_running():
 
 # ── 巡检逻辑 ────────────────────────────────────────────────────
 
+def lock_holder_pid():
+    """读 worker 单实例锁文件里的持有者 pid（worker_all.acquire_singleton_lock 写入）。
+    去重时必须保留持有者——它持有内存态 RUNNING/QUEUED，杀掉会丢排队/执行状态。"""
+    try:
+        with open(os.path.join(TASK_DIR, ".worker.lock"), encoding="utf-8") as f:
+            return int(f.read().strip() or 0)
+    except Exception:
+        return 0
+
+
+def dedup(pids):
+    """多实例去重：优先保留锁持有者；无锁信息时退回保留最小 pid。"""
+    if len(pids) <= 1:
+        return
+    holder = lock_holder_pid()
+    keep = holder if holder in pids else sorted(pids)[0]
+    for dup in sorted(pids):
+        if dup != keep:
+            stop_pid(dup)
+            log("去重: 结束多余 worker pid=%s（保留 %s%s）"
+                % (dup, keep, "，锁持有者" if holder == keep else ""))
+
+
 def tick():
     if MODE == "laptop":
         if not anchor_running():
@@ -211,18 +234,14 @@ def tick():
             return
         pids = worker_pids()
         if len(pids) > 1:
-            for dup in sorted(pids)[1:]:
-                stop_pid(dup)
-                log("去重: 结束多余 worker pid=%s（保留 %s）" % (dup, sorted(pids)[0]))
+            dedup(pids)
         elif not pids:
             spawn_worker()
         return
     # server 模式: 确保恰好一个 worker
     pids = worker_pids()
     if len(pids) > 1:
-        for dup in sorted(pids)[1:]:
-            stop_pid(dup)
-            log("去重: 结束多余 worker pid=%s" % dup)
+        dedup(pids)
     elif not pids:
         spawn_worker()
 

@@ -270,10 +270,18 @@ class GitHub:
 
 
 def transition(gh, number, add, remove):
-    for name in remove:
-        gh.remove_label(number, name)
-    if add:
-        gh.add_labels(number, add)
+    """单次 PATCH 原子切换标签：消除"先删后加"之间的无主窗口
+    （终态切换间隙被第三方认领已完成任务的竞态口）。"""
+    try:
+        cur = [l.get("name") if isinstance(l, dict) else str(l)
+               for l in (gh.issue(number).get("labels") or [])]
+    except Exception:
+        cur = []
+    final = [n for n in cur if n not in remove]
+    for n in add:
+        if n not in final:
+            final.append(n)
+    gh.request("PATCH", "/issues/%d" % number, {"labels": final})
 
 
 # ---------------------------------------------------------------- 协议核心
@@ -438,7 +446,7 @@ def do_claim(gh, args, worker, count, lease_min, tags):
             continue
         # 第 10 节：通用任务受容量限制
         lb = [l["name"] for l in iss.get("labels", [])]
-        if slots <= 0 and not any(lb.startswith("for:") for l in lb):
+        if slots <= 0 and not any(l.startswith("for:") for l in lb):
             skip_reasons.append("#%s 跳过(超出MAX_LOAD=%s)" % (iss["number"], max_load))
             continue
         got = try_claim(gh, iss, worker, lease_min, args and state_path_for(args), gh.repo)
@@ -472,9 +480,13 @@ def do_complete(gh, number, worker, result, force=False, state_path=None, repo=N
         owner, err = find_my_owner(gh, number, worker, entry and entry.get("claim_id"))
         if owner is None:
             die("无法完成 #%d：%s（如确需强制，请加 --force）" % (number, err), code=3)
-    gh.add_comment(number, RESULT_PREFIX + result)
+    # 顺序：①终态标签原子切换（单次 PATCH，无"删后未加"的无主窗口）→ ②关 issue
+    # → ③发 RESULT（发前查重防半失败重试双 RESULT）。
     transition(gh, number, add=["done"], remove=["claimed", "pending", "claimed-by-" + worker])
     gh.edit_issue(number, state="closed")
+    existing = [c for c in gh.comments(number) if (c.get("body") or "").startswith(RESULT_PREFIX)]
+    if not existing:
+        gh.add_comment(number, RESULT_PREFIX + result)
     if state_path and repo:
         drop_claim(state_path, repo, number)
 
@@ -485,9 +497,11 @@ def do_fail(gh, number, worker, error, force=False, state_path=None, repo=None):
         owner, err = find_my_owner(gh, number, worker, entry and entry.get("claim_id"))
         if owner is None:
             die("无法标记失败 #%d：%s（如确需强制，请加 --force）" % (number, err), code=3)
-    gh.add_comment(number, RESULT_PREFIX + "FAIL: " + error)
     transition(gh, number, add=["failed"], remove=["claimed", "pending", "claimed-by-" + worker])
     gh.edit_issue(number, state="closed")
+    existing = [c for c in gh.comments(number) if (c.get("body") or "").startswith(RESULT_PREFIX)]
+    if not existing:
+        gh.add_comment(number, RESULT_PREFIX + "FAIL: " + error)
     if state_path and repo:
         drop_claim(state_path, repo, number)
 

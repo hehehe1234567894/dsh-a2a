@@ -83,7 +83,7 @@ IDLE_EXIT_MIN = int(os.environ.get("TASKHUB_IDLE_EXIT_MIN", "0"))  # >0: 空闲 
 TERMINAL = {"done", "failed", "cancelled"}
 BRACKET = re.compile(r"[【\[]\s*(专属|通用|父)\s*[:：\s]?\s*([^\]】]*)[\]】]")
 CANCEL_MARK = re.compile(r"\[\s*CANCEL\s*#\s*(\d+)\s*\]", re.IGNORECASE)
-BODY_HASH = {}  # issue 号 -> 最近一次见到的正文 sha256（§13 需求变更监听）
+BODY_HASH = {}  # issue 号 -> 最近一次见到的正文 sha256（§13 需求变更监听；随 bodyhash.json 持久化）
 
 EXEC_ENABLED = os.environ.get("TASKHUB_EXEC", "1") == "1"
 EXEC_TIMEOUT_MIN = int(os.environ.get("TASKHUB_EXEC_TIMEOUT_MIN", "60"))
@@ -181,7 +181,7 @@ def parse_eligibility(title, body, labels):
     declared = False
     for ln in (body or "").splitlines():
         s = ln.strip().lstrip("\ufeff")
-        if s.startswith("资格"):
+        if re.match(r"资格\s*[:：]", s):
             declared = True
             raw = s.replace("：", ":", 1)
             if ":" in raw:
@@ -316,7 +316,7 @@ def my_open_claims(gh, sp):
                     "请立即用 board.py show --issue %s 重读【全部正文与全部评论】（最新正文为唯一权威），"
                     "按最新要求调整执行；已完成且不冲突的部分无需回退，与新旧要求冲突的部分立即停下。"
                     % (num, num))
-            sid = _executor_sid(num)
+            sid = _executor_sid(num) or QUEUED.get(num)  # 串行/插队任务无 pid 文件，从 QUEUED 取承载会话（§13.2 盲区修复）
             if sid and executor_web is not None:
                 try:
                     executor_web.prompt(sid, note)
@@ -327,6 +327,7 @@ def my_open_claims(gh, sp):
                           "event": "spec-update", "worker": WORKER, "issue": num,
                           "title": title, "body": note})
         BODY_HASH[num] = h
+        _bh_save()
         mine.append((num, title))
     return mine
 
@@ -352,10 +353,15 @@ def candidates(gh, now, mine_numbers=frozenset()):
             continue  # 他人专属 → 严禁认领（§3 硬性规则）
         if elig["type"] == "父" and elig["parent"] not in mine_numbers:
             continue  # 未领父任务 → 禁领子任务（§3 硬性规则）
-        owner = board.resolve_owner(board.parse_claims(gh.comments(iss["number"])), now)
+        cs = gh.comments(iss["number"])  # 无主检查与 CANCEL 检测共用这一次评论拉取
+        owner = board.resolve_owner(board.parse_claims(cs), now)
         if owner:
             held += 1
             continue  # 已被持有（含 v1 永久租约）
+        author = (iss.get("user") or {}).get("login") or ""
+        if any(CANCEL_MARK.search((c.get("body") or "") or "")
+               and (c.get("user") or {}).get("login") == author for c in cs):
+            continue  # 发布方已 [CANCEL]（曾被认领后释放回 pending）→ 永不认领，防认领-取消横跳
         out.append(iss)
     # §12: P0/P1 优先，同级 FIFO
     out.sort(key=lambda x: (min([board.PRIORITIES.get(lb["name"], 9)
@@ -575,17 +581,30 @@ def spawn_executor(claim, gh=None):
             try:
                 ctx_prompt = _executor_prompt(n, claim.get("title") or "",
                                               _issue_context(gh, n, body))
+                # write-ahead：先落幂等标记再 push，push 成功后标记保留；
+                # 超时类异常保留标记（服务端大概率已入队，防重复推），
+                # 其他异常撤标记（连接失败等，下轮干净重试）。
+                QUEUED[n] = sid
+                _queued_save()
                 if mode == "barge":
                     executor_web.cancel(sid)  # ⚡ 打断当前轮次
                     executor_web.prompt(sid, ctx_prompt)
-                    executor_web.prompt(sid, _barge_aftercare(holder, sid))  # 队列第二位：善后
+                    try:  # 善后失败只记日志：任务正文自带兜底重读规则，不重入 barge（防活锁）
+                        executor_web.prompt(sid, _barge_aftercare(holder, sid))  # 队列第二位：善后
+                    except Exception as e2:
+                        log("ℹ️ #%s 善后指令投递失败（正文兜底可覆盖）:" % n, e2)
                     log("⚡ #%s 紧急插队 → 已打断会话 %s…，立即接管（原任务已排善后指令）" % (n, sid[:24]))
                 else:
                     executor_web.prompt(sid, ctx_prompt)
                     log("🔗 #%s 串行排队 → 会话 %s…（DSH 原生 queue，按序执行）" % (n, sid[:24]))
-                QUEUED[n] = sid  # 幂等标记：排队/插队期间绝不重复 push（清理见 one_round）
             except Exception as e:
-                log("串行/插队失败 #%s（下轮重试）:" % n, e)
+                msg = str(e).lower()
+                if "timeout" in msg or "timed out" in msg:
+                    log("⏳ #%s 排队 push 超时（服务端大概率已入队），保留幂等标记防重复推送" % n)
+                else:
+                    QUEUED.pop(n, None)
+                    _queued_save()
+                    log("串行/插队失败 #%s（已撤标记，下轮重试）:" % n, e)
             return
     os.makedirs(EXEC_DIR, exist_ok=True)
     context = _issue_context(gh, n, body)
@@ -609,14 +628,44 @@ def spawn_executor(claim, gh=None):
                 log("ℹ️ #%s 执行空间 %s 未预配 agentPreset（TASKHUB_SPACE_PRESET），按宿主策略运行 + prompt 级约束" % (n, space.group(1)))
                 prompt += ("\n\n【执行空间约束】发布方声明执行空间=%s：仅在完成任务所必需的范围内读写，"
                            "不得触碰范围外文件或执行破坏性操作；该约束为提示级，宿主策略以机器配置为准。" % space.group(1))
-            sid = executor_web.create_session(
-                cwd=os.environ.get("TASKHUB_EXEC_CWD") or BASE,
-                session_id="taskhub-%d" % n,
-                **({"agentPreset": preset} if preset else {}))
+            try:
+                sid = executor_web.create_session(
+                    cwd=os.environ.get("TASKHUB_EXEC_CWD") or BASE,
+                    session_id="taskhub-%d" % n,
+                    **({"agentPreset": preset} if preset else {}))
+            except Exception as e:
+                # 同名残留会话且 cwd 不一致（历史实例 cwd 漂移）→ 换随机后缀兜底，不再卡死重试
+                if "already exists" in str(e) or "session-conflict" in str(e):
+                    sid = executor_web.create_session(
+                        cwd=os.environ.get("TASKHUB_EXEC_CWD") or BASE,
+                        session_id="taskhub-%d-%s" % (n, os.urandom(2).hex()),
+                        **({"agentPreset": preset} if preset else {}))
+                    log("ℹ️ #%s 同名会话 cwd 冲突，改用新会话 %s…（旧会话为历史残留）" % (n, sid[:20]))
+                else:
+                    raise
             _apply_task_model(sid, body, n)
-            executor_web.prompt(sid, prompt)
+            # write-ahead：先写 pid 文件（executor_state 判活凭据）再 push，
+            # 防 push 超时/写 pid 失败后 ensure 下轮误判 None → 同会话重复投递。
             with open(os.path.join(EXEC_DIR, f"{n}.pid"), "w", encoding="utf-8") as f:
                 json.dump({"sid": sid, "pid": 0, "ts": int(time.time()), "issue": n}, f)
+            try:
+                executor_web.prompt(sid, prompt)
+            except Exception as pe:
+                # push 确认失败（连接错误等）：取消会话并清场，下轮干净重派；超时则保留（大概率已入队）
+                msg = str(pe).lower()
+                if "timeout" in msg or "timed out" in msg:
+                    RUNNING.add(n)
+                    log("⏳ #%s push 超时（服务端大概率已入队），保留执行器标记" % n)
+                    return
+                try:
+                    executor_web.cancel(sid)
+                except Exception:
+                    pass
+                try:
+                    os.remove(os.path.join(EXEC_DIR, f"{n}.pid"))
+                except OSError:
+                    pass
+                raise
             RUNNING.add(n)
             log("🚀 已通过 web API 派生执行会话 #%s（sid=%s…，web 侧边栏可见）" % (n, sid[:20]))
             return
@@ -721,6 +770,75 @@ def executor_state(n):
     return "alive", age
 
 
+def _bh_save():
+    """BODY_HASH 持久化：守护重启后不把宕机期间的正文变更当"首次见到"，
+    保证 §13 SPEC UPDATE 推送不因重启而静默丢失。"""
+    try:
+        with open(os.path.join(EXEC_DIR, "bodyhash.json"), "w", encoding="utf-8") as f:
+            json.dump({str(k): v for k, v in BODY_HASH.items()}, f)
+    except OSError:
+        pass
+
+
+def _bh_load():
+    try:
+        with open(os.path.join(EXEC_DIR, "bodyhash.json"), encoding="utf-8") as f:
+            for k, v in (json.load(f) or {}).items():
+                BODY_HASH[int(k)] = v
+    except Exception:
+        pass
+
+
+def _queued_save():
+    """QUEUED 持久化（EXEC_DIR/queued.json）：守护重启后恢复排队标记，
+    防止对新会话重复 push 已在队列中的 prompt（重复推送根因之一）。"""
+    try:
+        with open(os.path.join(EXEC_DIR, "queued.json"), "w", encoding="utf-8") as f:
+            json.dump({str(k): v for k, v in QUEUED.items()}, f)
+    except OSError:
+        pass
+
+
+def _queued_load():
+    try:
+        with open(os.path.join(EXEC_DIR, "queued.json"), encoding="utf-8") as f:
+            for k, v in (json.load(f) or {}).items():
+                QUEUED[int(k)] = v
+    except Exception:
+        pass
+
+
+def acquire_singleton_lock():
+    """单实例互斥锁（BASE/.worker.lock，非阻塞；guard_all 去重时读取该文件保留持有者）。
+    多实例并发 + 内存态 RUNNING/QUEUED 不互通 = 重复投递/状态撕裂的根源，第二实例直接退出。
+    返回锁文件句柄（持有到进程退出自动释放）；None=已有实例。"""
+    os.makedirs(BASE, exist_ok=True)
+    lock_path = os.path.join(BASE, ".worker.lock")
+    lf = None
+    try:
+        lf = open(lock_path, "r+")  # 不用 "w"：避免 truncate 抹掉前任 pid（日志/去重需要）
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(lf.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(lf.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        lf.seek(0)
+        lf.truncate()
+        lf.write(str(os.getpid()))
+        lf.flush()
+        return lf
+    except (OSError, IOError):
+        holder = ""
+        try:
+            with open(lock_path, encoding="utf-8") as f:
+                holder = f.read().strip()
+        except Exception:
+            pass
+        log("已有 worker 实例持有锁（pid=%s），本实例退出" % (holder or "?"))
+        return None
+
+
 def ensure_executors(gh, mine):
     """每轮自愈对账：名下每个进行中任务都必须有活着的执行器。
     覆盖守护重启/崩溃后"接了任务没执行"的场景（服务器异常自愈的核心）。"""
@@ -766,10 +884,12 @@ def one_round(gh, sp, last_hb):
     for n in list(BODY_HASH.keys()):
         if n not in mine_numbers:
             BODY_HASH.pop(n, None)  # 任务已结束/释放 → 停止监听
+            _bh_save()
     for n, sid in list(QUEUED.items()):
         if n not in mine_numbers:
             QUEUED.pop(n, None)
             QUEUED_LOST.pop(n, None)  # 任务已结束（complete/fail/release）→ 幂等标记随之清除
+            _queued_save()
             continue
         # 与 holder 的 RUNNING 状态解耦：holder 任务完成≠会话死亡，队列里的 prompt 仍会执行。
         # 仅当会话连续 2 次确认不在列（prompt 真丢失）才清除标记、下轮重新分流；
@@ -784,6 +904,7 @@ def one_round(gh, sp, last_hb):
             if QUEUED_LOST[n] >= 2:
                 QUEUED.pop(n, None)
                 QUEUED_LOST.pop(n, None)
+                _queued_save()
                 log("⚠️ #%s 的排队目标会话已不存在（prompt 丢失），下轮重新分流" % n)
     for n in list(RUNNING - mine_numbers):  # 已结束任务的执行器记录清理
         RUNNING.discard(n)
@@ -806,9 +927,12 @@ def one_round(gh, sp, last_hb):
                                      "(专属可超)" if capacity_left <= 0 else ""))
     claimed = pick_and_claim(gh, sp, mine_numbers, capacity_left)
     for claim, elig in claimed:
-        echo_to_session(claim, elig)
-        if not EXEC_OFF:
-            spawn_executor(claim, gh)
+        try:  # 单个认领的处理失败不中断循环：后续任务的 echo/执行器与 ensure 自愈仍要跑
+            echo_to_session(claim, elig)
+            if not EXEC_OFF:
+                spawn_executor(claim, gh)
+        except Exception as e:
+            log("认领任务 #%s 处理失败（下轮自愈对账兜底）:" % claim.get("issue"), e)
     ensure_executors(gh, mine)  # 自愈对账：重启/孤儿认领也会被补上执行器
     if not claimed and not mine:
         log("暂无可认领任务（空闲 %d/%d）" % (len(mine), MAX_LOAD))
@@ -824,6 +948,11 @@ def main():
     if hasattr(signal, "SIGTERM"):
         signal.signal(signal.SIGTERM, _graceful)
     sp = board.state_path_for(args_ns())
+    _LOCK_FH = acquire_singleton_lock()  # 必须持有句柄引用：未接收会被 GC 关闭导致锁立即失效
+    if _LOCK_FH is None:
+        return  # 已有实例在跑
+    _queued_load()  # 恢复上一实例的排队标记（防重启后重复 push）
+    _bh_load()  # 恢复正文哈希（防宕机期间 SPEC UPDATE 静默丢失）
     last_hb = {}
     last_busy = time.time()
     while True:
@@ -835,8 +964,8 @@ def main():
             elif IDLE_EXIT_MIN > 0 and time.time() - last_busy >= IDLE_EXIT_MIN * 60:
                 log("空闲已 ≥ %d 分钟，自行退出（看门狗/锚进程恢复活动时会按需拉起）" % IDLE_EXIT_MIN)
                 return
-        except Exception as e:
-            log("异常（重试中）:", e)
+        except (Exception, SystemExit) as e:
+            log("异常（继续运行）:", e)
         if ONCE:
             log("单轮模式结束")
             return
